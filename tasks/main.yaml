@@ -1,0 +1,150 @@
+# vim:ts=2:sw=2:et:ai:sts=2
+---
+- name: check cloud-init presence
+  stat:
+    path: /etc/cloud/cloud.cfg
+  register: _cloud_init_cfg
+  when: base_setup__disable_cloud_init | bool
+  check_mode: false
+
+- name: disable cloud-init
+  file:
+    path: /etc/cloud/cloud-init.disabled
+    state: touch
+    modification_time: preserve
+    access_time: preserve
+  when: base_setup__disable_cloud_init | bool and _cloud_init_cfg.stat.exists
+
+# Needs to be executed after `dbus` is installed and started.
+- name: set hostname
+  hostname:
+    name: '{{ _base_setup__hostname_short }}'
+  when: base_setup__set_hostname
+
+- name: set FDQN with IPv4 localhost address
+  lineinfile:
+    dest: /etc/hosts
+    line: |-
+      127.0.1.1	{{ base_setup__set_hostname }}	{{ _base_setup__hostname_short }}
+    regexp: '^127\.0\.1\.1\s'
+    insertafter: '^127\.0\.0\.1\s'
+    state: present
+  when: base_setup__set_hostname
+
+- name: set FDQN with IPv6 localhost address
+  lineinfile:
+    dest: /etc/hosts
+    line: |-
+      ::1	{{ base_setup__set_hostname }}	{{ _base_setup__hostname_short }}
+    regexp: '^::1\s+(?!(?:ip6-)?localhost)\S+'
+    insertafter: '^::1\s'
+    state: present
+  when: base_setup__set_hostname
+
+- name: setup APT, upgrade installed packages, and install base packages
+  include_role:
+    name: apt
+  vars:
+    apt__run_upgrade: true
+    apt__run_autoremove: true
+    apt__purge_removed: true
+    apt__packages_to_install: '{{ _base_setup__pkg_install }}'
+    apt__services_to_enable: '{{ _base_setup__svc_enable_start }}'
+    apt__services_to_start: '{{ _base_setup__svc_enable_start }}'
+
+- name: set mail relay
+  lineinfile:
+    dest: /etc/postfix/main.cf
+    line: 'relayhost = {{ base_setup__mail_relay }}'
+    regexp: '^relayhost\s*='
+    insertafter: '^\s*#relayhost'
+    state: present
+  when: base_setup__mail_relay and base_setup__setup_postfix
+  notify: base_setup__reload_postfix
+
+- name: 'set-up sudoers: sudo group'
+  lineinfile:
+      dest: /etc/sudoers
+      state: present
+      regexp: '^%sudo\s'
+      line: '%sudo ALL=(ALL) ALL'
+      validate: 'visudo -cf %s'
+  when: base_setup__setup_sudo
+
+- name: 'set-up sudoers: sudo-nopw group'
+  lineinfile:
+      dest: /etc/sudoers
+      state: present
+      regexp: '^%sudo-nopw\s'
+      line: '%sudo-nopw ALL=(ALL) NOPASSWD: ALL'
+      validate: 'visudo -cf %s'
+  when: base_setup__setup_sudo
+
+- name: set default locale
+  debconf:
+    name: locales
+    question: locales/default_environment_locale
+    value: '{{ base_setup__default_locale }}'
+    vtype: select
+  when: base_setup__setup_locales
+  notify: base_setup__reconfigure_locales
+
+- name: set list of locales to be generated
+  debconf:
+    name: locales
+    question: locales/locales_to_be_generated
+    value: '{{ base_setup__locales_to_be_generated | join(", ") }}'
+    vtype: multiselect
+  when: base_setup__setup_locales
+  notify: base_setup__reconfigure_locales
+
+- name: bash defaults
+  template:
+    src: bash.bashrc.j2
+    dest: /etc/bash.bashrc
+
+- name: 'sshd: verify host keys presence'
+  find:
+    paths: /etc/ssh
+    patterns: 'ssh_host_*'
+  register: _ssh_host_keys
+
+- name: 'sshd: regenerate host keys'
+  command:
+    cmd: 'dpkg-reconfigure openssh-server'
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  when: not _ssh_host_keys.files
+  notify: base_setup__reload_sshd
+
+- name: 'sshd: disable password authentication'
+  lineinfile:
+      dest: /etc/ssh/sshd_config
+      state: present
+      regexp: '^PasswordAuthentication\s'
+      insertafter: '^#\s*PasswordAuthentication\s'
+      line: |-
+        PasswordAuthentication {{
+          'yes' if base_setup__sshd_password_auth_allowed else 'no'
+        }}
+  when: base_setup__sshd_password_auth_allowed in (True, False)
+  notify: base_setup__reload_sshd
+
+- name: 'sshd: disable root login'
+  lineinfile:
+      dest: /etc/ssh/sshd_config
+      state: present
+      regexp: '^PermitRootLogin\s'
+      insertafter: '^#\s*PermitRootLogin\s'
+      line: |-
+        PermitRootLogin {{
+          'prohibit-password' if base_setup__sshd_root_login_allowed else 'no'
+        }}
+  when: base_setup__sshd_root_login_allowed in (True, False)
+  notify: base_setup__reload_sshd
+
+- name: 'sshd: enable and start service'
+  service:
+    name: sshd
+    state: started
+    enabled: true
